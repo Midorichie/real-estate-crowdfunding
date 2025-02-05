@@ -6,9 +6,17 @@ telemetry = false
 requirements = []
 boot_contracts = []
 
+[contracts.nft-trait]
+path = "contracts/nft-trait.clar"
+depends_on = []
+
+[contracts.project-token]
+path = "contracts/project-token.clar"
+depends_on = ["nft-trait"]
+
 [contracts.crowdfunding]
 path = "contracts/crowdfunding.clar"
-depends_on = []
+depends_on = ["project-token"]
 
 [repl]
 costs_version = 2

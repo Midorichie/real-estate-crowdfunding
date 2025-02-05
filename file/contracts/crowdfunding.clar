@@ -9,8 +9,16 @@
 (define-constant err-milestone-not-found (err u104))
 (define-constant err-insufficient-funds (err u105))
 (define-constant err-invalid-project-id (err u106))
+(define-constant err-unauthorized (err u107))
+(define-constant err-already-initialized (err u108))
+(define-constant err-not-active (err u109))
+(define-constant minimum-contribution u1000000) ;; 1 STX minimum
 
 ;; Data Variables
+(define-data-var contract-initialized bool false)
+(define-data-var contract-paused bool false)
+(define-data-var project-counter uint u0)
+
 (define-map Projects
     { project-id: uint }
     {
@@ -18,7 +26,9 @@
         target-amount: uint,
         current-amount: uint,
         status: (string-ascii 20),
-        milestone-count: uint
+        milestone-count: uint,
+        created-at: uint,
+        deadline: uint
     }
 )
 
@@ -27,38 +37,68 @@
     {
         description: (string-ascii 256),
         amount: uint,
-        status: (string-ascii 20)
+        status: (string-ascii 20),
+        approvals: uint
     }
 )
 
 (define-map Contributions
     { project-id: uint, contributor: principal }
-    { amount: uint }
+    { 
+        amount: uint,
+        timestamp: uint,
+        refunded: bool
+    }
 )
-
-;; Project counter for generating unique IDs
-(define-data-var project-counter uint u0)
 
 ;; Private Functions
 
-;; Validate project ID
-(define-private (is-valid-project-id (project-id uint)) 
-    (and 
-        (< project-id (var-get project-counter))
-        (is-some (map-get? Projects { project-id: project-id }))
+;; Authorization check
+(define-private (is-contract-owner)
+    (is-eq tx-sender contract-owner)
+)
+
+;; Initialize contract
+(define-public (initialize)
+    (begin
+        (asserts! (is-contract-owner) err-owner-only)
+        (asserts! (not (var-get contract-initialized)) err-already-initialized)
+        (var-set contract-initialized true)
+        (ok true)
     )
 )
 
-;; Public Functions
+;; Emergency pause
+(define-public (set-pause (paused bool))
+    (begin
+        (asserts! (is-contract-owner) err-owner-only)
+        (var-set contract-paused paused)
+        (ok true)
+    )
+)
 
-;; Create new project
-(define-public (create-project (target-amount uint) (milestone-count uint))
+;; Validate project ID and status
+(define-private (is-valid-active-project (project-id uint)) 
+    (match (map-get? Projects { project-id: project-id })
+        project (and 
+            (< project-id (var-get project-counter))
+            (is-eq (get status project) "active")
+        )
+        false
+    )
+)
+
+;; Create new project with deadline
+(define-public (create-project (target-amount uint) (milestone-count uint) (duration-days uint))
     (let
         (
             (project-id (var-get project-counter))
+            (deadline (+ block-height (* duration-days u144))) ;; ~144 blocks per day
         )
-        (asserts! (> target-amount u0) err-invalid-amount)
+        (asserts! (not (var-get contract-paused)) err-not-active)
+        (asserts! (> target-amount minimum-contribution) err-invalid-amount)
         (asserts! (> milestone-count u0) err-invalid-amount)
+        (asserts! (>= duration-days u1) err-invalid-amount)
         (asserts! (map-insert Projects
             { project-id: project-id }
             {
@@ -66,7 +106,9 @@
                 target-amount: target-amount,
                 current-amount: u0,
                 status: "active",
-                milestone-count: milestone-count
+                milestone-count: milestone-count,
+                created-at: block-height,
+                deadline: deadline
             }
         ) err-project-exists)
         (var-set project-counter (+ project-id u1))
@@ -74,29 +116,32 @@
     )
 )
 
-;; Contribute to project
+;; Contribute to project with rate limiting
 (define-public (contribute (project-id uint))
     (begin
-        ;; Validate project ID first
-        (asserts! (is-valid-project-id project-id) err-invalid-project-id)
+        (asserts! (not (var-get contract-paused)) err-not-active)
+        (asserts! (is-valid-active-project project-id) err-invalid-project-id)
         (let
             (
                 (project (unwrap! (map-get? Projects { project-id: project-id }) err-project-not-found))
                 (contribution-amount (stx-get-balance tx-sender))
             )
-            (asserts! (> contribution-amount u0) err-invalid-amount)
+            (asserts! (>= contribution-amount minimum-contribution) err-invalid-amount)
+            (asserts! (<= block-height (get deadline project)) err-not-active)
             (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
             
-            ;; Update project current amount
             (map-set Projects
                 { project-id: project-id }
                 (merge project { current-amount: (+ (get current-amount project) contribution-amount) })
             )
             
-            ;; Record contribution
             (map-set Contributions
                 { project-id: project-id, contributor: tx-sender }
-                { amount: contribution-amount }
+                { 
+                    amount: contribution-amount,
+                    timestamp: block-height,
+                    refunded: false
+                }
             )
             
             (ok true)
@@ -104,22 +149,29 @@
     )
 )
 
-;; Read-only functions
-
-;; Get project details
-(define-read-only (get-project (project-id uint))
+;; Request refund if deadline passed and target not met
+(define-public (request-refund (project-id uint))
     (begin
-        (asserts! (is-valid-project-id project-id) err-invalid-project-id)
-        (ok (unwrap! (map-get? Projects { project-id: project-id }) err-project-not-found))
-    )
-)
-
-;; Get contribution amount
-(define-read-only (get-contribution (project-id uint) (contributor principal))
-    (begin
-        (asserts! (is-valid-project-id project-id) err-invalid-project-id)
-        (ok (unwrap! (map-get? Contributions 
-            { project-id: project-id, contributor: contributor }
-        ) err-project-not-found))
+        (asserts! (is-valid-active-project project-id) err-invalid-project-id)
+        (let
+            (
+                (project (unwrap! (map-get? Projects { project-id: project-id }) err-project-not-found))
+                (contribution (unwrap! (map-get? Contributions 
+                    { project-id: project-id, contributor: tx-sender }
+                ) err-project-not-found))
+            )
+            (asserts! (> (get deadline project) block-height) err-not-active)
+            (asserts! (< (get current-amount project) (get target-amount project)) err-unauthorized)
+            (asserts! (not (get refunded contribution)) err-unauthorized)
+            
+            (try! (as-contract (stx-transfer? (get amount contribution) tx-sender tx-sender)))
+            
+            (map-set Contributions
+                { project-id: project-id, contributor: tx-sender }
+                (merge contribution { refunded: true })
+            )
+            
+            (ok true)
+        )
     )
 )
