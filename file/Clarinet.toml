@@ -1,0 +1,24 @@
+[project]
+name = "real-estate-crowdfunding"
+authors = ["Your Name"]
+description = "A decentralized crowdfunding platform for real estate projects"
+telemetry = false
+requirements = []
+boot_contracts = []
+
+[contracts.crowdfunding]
+path = "contracts/crowdfunding.clar"
+depends_on = []
+
+[repl]
+costs_version = 2
+parser_version = 2
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[repl.analysis.check_checker]
+strict = true
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
